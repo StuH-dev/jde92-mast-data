@@ -91,7 +91,7 @@ function Import-CsvToSql {
         }
     }
     
-    function Ensure-LogTable {
+    function New-LogTable {
         param(
             [System.Data.SqlClient.SqlConnection]$Connection
         )
@@ -593,7 +593,7 @@ VALUES
         $sqlConnection.Open()
         Write-Log "Connected to database" "SUCCESS"
         
-        Ensure-LogTable -Connection $sqlConnection
+        New-LogTable -Connection $sqlConnection
         
         if (-not [System.IO.Path]::IsPathRooted($CsvDirectory)) {
             $CsvDirectory = Join-Path (Get-Location).Path $CsvDirectory
