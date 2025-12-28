@@ -1,3 +1,14 @@
+param(
+    [string]$CsvDirectory = "DATA_FILES_TO_IMPORT",
+    [string]$ServerInstance = 'localhost\SQLExpress',
+    [string]$Database = 'sales-dashboard',
+    [string]$Username = 'sa',
+    [string]$Password = 'Pcare2009',
+    [switch]$IntegratedSecurity,
+    [switch]$TruncateBeforeImport,
+    [string]$TempFolder = "C:\Temp\CSV_Import"
+)
+
 function Import-CsvToSql {
     param(
         [string]$CsvDirectory = "DATA_FILES_TO_IMPORT",
@@ -6,8 +17,8 @@ function Import-CsvToSql {
         [string]$Username = 'sa',
         [string]$Password = 'Pcare2009',
         [switch]$IntegratedSecurity,
-        [int]$BatchSize = 1000,
-        [switch]$TruncateBeforeImport
+        [switch]$TruncateBeforeImport,
+        [string]$TempFolder = "C:\Temp\CSV_Import"
     )
     
     $ErrorActionPreference = "Stop"
@@ -30,7 +41,7 @@ function Import-CsvToSql {
         Write-Host "[$timestamp] [$Level] $Message" -ForegroundColor $color
     }
     
-    function Ensure-ProcessingFolders {
+    function Initialize-ProcessingFolders {
         param(
             [string]$BaseDirectory
         )
@@ -160,6 +171,146 @@ ORDER BY ORDINAL_POSITION
         return $columns
     }
     
+    function Invoke-SqlBulkInsert {
+        param(
+            [System.Data.SqlClient.SqlConnection]$Connection,
+            [System.IO.FileInfo]$CsvFile,
+            [string]$TableName,
+            [array]$MatchingColumns,
+            [hashtable]$TableColumnInfo,
+            [string]$TempFolder
+        )
+        
+        $tempTableName = "##TempImport_$([System.Guid]::NewGuid().ToString().Replace('-', ''))"
+        $tempFilePath = $null
+        
+        try {
+            if (-not (Test-Path $TempFolder)) {
+                New-Item -ItemType Directory -Path $TempFolder -Force | Out-Null
+                Write-Log "Created temp folder: $TempFolder" "INFO"
+            }
+            
+            $tempFileName = "$($CsvFile.BaseName)_$([System.Guid]::NewGuid().ToString().Replace('-', ''))$($CsvFile.Extension)"
+            $tempFilePath = Join-Path $TempFolder $tempFileName
+            
+            Write-Log "Preparing CSV file for BULK INSERT (converting to unquoted format): $tempFilePath" "INFO"
+            
+            $csvData = Import-Csv -Path $CsvFile.FullName -Encoding UTF8
+            $csvLines = @()
+            
+            foreach ($row in $csvData) {
+                $values = @()
+                foreach ($colName in $MatchingColumns) {
+                    $val = $row.$colName
+                    if ($null -eq $val) {
+                        $val = ""
+                    }
+                    $values += $val
+                }
+                $csvLines += ($values -join ',')
+            }
+            
+            $headerLine = $MatchingColumns -join ','
+            $allLines = @($headerLine) + $csvLines
+            $allLines | Set-Content -Path $tempFilePath -Encoding UTF8
+            
+            $filePath = $tempFilePath.Replace('\', '\\')
+            
+            Write-Log "Creating temporary staging table: $tempTableName" "INFO"
+            
+            $createTempTableQuery = "CREATE TABLE [$tempTableName] ("
+            $columns = @()
+            foreach ($colName in $MatchingColumns) {
+                $dataType = $TableColumnInfo[$colName].DataType
+                $charLength = $TableColumnInfo[$colName].CharLength
+                $isNullable = $TableColumnInfo[$colName].IsNullable
+                
+                $sqlType = switch -Regex ($dataType) {
+                    '^(n?char)' {
+                        if ($null -ne $charLength) {
+                            "$dataType($charLength)"
+                        } else {
+                            "$dataType(255)"
+                        }
+                    }
+                    '^(n?varchar)' {
+                        if ($null -ne $charLength) {
+                            "$dataType($charLength)"
+                        } else {
+                            "$dataType(MAX)"
+                        }
+                    }
+                    default { $dataType }
+                }
+                
+                $nullability = if ($isNullable) { "NULL" } else { "NOT NULL" }
+                $columns += "[$colName] $sqlType $nullability"
+            }
+            $createTempTableQuery += ($columns -join ", ") + ")"
+            
+            $command = New-Object System.Data.SqlClient.SqlCommand($createTempTableQuery, $Connection)
+            $command.ExecuteNonQuery() | Out-Null
+            
+            Write-Log "Loading data into staging table using BULK INSERT" "INFO"
+            
+            $bulkInsertQuery = @"
+BULK INSERT [$tempTableName]
+FROM '$filePath'
+WITH (
+    FIELDTERMINATOR = ',',
+    ROWTERMINATOR = '\n',
+    FIRSTROW = 2,
+    CODEPAGE = '65001',
+    TABLOCK
+)
+"@
+            
+            $command = New-Object System.Data.SqlClient.SqlCommand($bulkInsertQuery, $Connection)
+            $command.ExecuteNonQuery() | Out-Null
+            
+            Write-Log "Copying data from staging table to target table (deduplicating)" "INFO"
+            
+            $columnList = ($MatchingColumns | ForEach-Object { "[$_]" }) -join ", "
+            $insertQuery = @"
+INSERT INTO [DBO].[$TableName] ($columnList) 
+SELECT $columnList 
+FROM (
+    SELECT $columnList, ROW_NUMBER() OVER (PARTITION BY $columnList ORDER BY (SELECT NULL)) AS rn
+    FROM [$tempTableName]
+) AS deduped
+WHERE rn = 1
+"@
+            
+            $command = New-Object System.Data.SqlClient.SqlCommand($insertQuery, $Connection)
+            $rowsInserted = $command.ExecuteNonQuery()
+            
+            Write-Log "Dropping temporary staging table" "INFO"
+            $dropQuery = "DROP TABLE [$tempTableName]"
+            $command = New-Object System.Data.SqlClient.SqlCommand($dropQuery, $Connection)
+            $command.ExecuteNonQuery() | Out-Null
+            
+            return $rowsInserted
+        } catch {
+            try {
+                $dropQuery = "IF OBJECT_ID('tempdb..[$tempTableName]') IS NOT NULL DROP TABLE [$tempTableName]"
+                $command = New-Object System.Data.SqlClient.SqlCommand($dropQuery, $Connection)
+                $command.ExecuteNonQuery() | Out-Null
+            } catch {
+                Write-Log "Warning: Could not drop temporary table $tempTableName" "WARNING"
+            }
+            throw
+        } finally {
+            if ($null -ne $tempFilePath -and (Test-Path $tempFilePath)) {
+                try {
+                    Remove-Item -Path $tempFilePath -Force -ErrorAction SilentlyContinue
+                    Write-Log "Cleaned up temporary file: $tempFilePath" "INFO"
+                } catch {
+                    Write-Log "Warning: Could not delete temporary file $tempFilePath" "WARNING"
+                }
+            }
+        }
+    }
+    
     function Write-LogEntry {
         param(
             [System.Data.SqlClient.SqlConnection]$Connection,
@@ -221,7 +372,9 @@ VALUES
             [System.IO.FileInfo]$CsvFile,
             [string]$TableName,
             [string]$ProcessedFolder,
-            [string]$ErrorFolder
+            [string]$ErrorFolder,
+            [switch]$TruncateBeforeImport,
+            [string]$TempFolder
         )
         
         $script:fileStartTime = Get-Date
@@ -352,118 +505,28 @@ VALUES
                 Write-Log "Missing optional columns (will be set to NULL): $($missingColumns -join ', ')" "WARNING"
             }
             
+            Write-Log "Step 11: Preparing bulk insert" "INFO"
+            
             if ($TruncateBeforeImport) {
                 Write-Log "Truncating table before import..." "WARNING"
                 $truncateQuery = "TRUNCATE TABLE [DBO].[$TableName]"
                 $command = New-Object System.Data.SqlClient.SqlCommand($truncateQuery, $Connection)
                 $command.ExecuteNonQuery() | Out-Null
-                Write-Log "Table truncated" "SUCCESS"
+                Write-Log "Table truncated successfully" "SUCCESS"
             }
-            
-            Write-Log "Step 11: Preparing bulk copy" "INFO"
             
             $rowsProcessed = $csvDataArray.Count
             $rowsInserted = 0
             $rowsFailed = 0
-            $bulkCopy = $null
-            $dataTable = $null
             
             try {
-                $dataTable = New-Object System.Data.DataTable
-                
-                foreach ($colName in $matchingColumns) {
-                    $column = New-Object System.Data.DataColumn($colName, [string])
-                    $column.AllowDBNull = $tableColumnInfo[$colName].IsNullable
-                    $dataTable.Columns.Add($column) | Out-Null
-                }
-                
-                Write-Log "Step 12: Loading CSV data into DataTable ($rowsProcessed rows, $($matchingColumns.Count) columns)" "INFO"
-                $rowNum = 0
-                $lastLogTime = Get-Date
-                foreach ($csvRow in $csvDataArray) {
-                    $rowNum++
-                    try {
-                        $dataRow = $dataTable.NewRow()
-                        
-                        foreach ($colName in $matchingColumns) {
-                            $val = $csvRow.$colName
-                            $dataType = $tableColumnInfo[$colName].DataType
-                            $isNullable = $tableColumnInfo[$colName].IsNullable
-                            $charLength = $tableColumnInfo[$colName].CharLength
-                            
-                            $isFixedLengthChar = $dataType -match '^(n?char)'
-                            
-                            if ([string]::IsNullOrWhiteSpace($val)) {
-                                if ($isNullable) {
-                                    $dataRow[$colName] = [DBNull]::Value
-                                } elseif ($isFixedLengthChar -and $null -ne $charLength) {
-                                    $dataRow[$colName] = "".PadRight($charLength)
-                                } else {
-                                    throw "Required column '$colName' is NULL or empty in file '$fileName', table '$TableName', row $rowNum"
-                                }
-                            } else {
-                                if ($isFixedLengthChar -and $null -ne $charLength) {
-                                    if ($val.Length -lt $charLength) {
-                                        $dataRow[$colName] = $val.PadRight($charLength)
-                                    } else {
-                                        $dataRow[$colName] = $val.Substring(0, $charLength)
-                                    }
-                                } else {
-                                    $dataRow[$colName] = $val.Trim()
-                                }
-                            }
-                        }
-                        
-                        $dataTable.Rows.Add($dataRow) | Out-Null
-                        
-                        $currentTime = Get-Date
-                        if (($currentTime - $lastLogTime).TotalSeconds -ge 5 -or $rowNum % 100 -eq 0) {
-                            Write-Progress -Activity "Preparing bulk copy for $fileName" -Status "Processed $rowNum of $rowsProcessed rows" -PercentComplete (($rowNum / $rowsProcessed) * 100)
-                            if (($currentTime - $lastLogTime).TotalSeconds -ge 5) {
-                                Write-Log "Processed $rowNum of $rowsProcessed rows..." "INFO"
-                                $lastLogTime = $currentTime
-                            }
-                        }
-                    } catch {
-                        $rowsFailed++
-                        Write-Log "Error processing row $rowNum - $_" "ERROR"
-                    }
-                }
-                
-                Write-Progress -Activity "Preparing bulk copy for $fileName" -Completed
-                
-                if ($dataTable.Rows.Count -eq 0) {
-                    throw "No valid rows to insert after processing CSV data"
-                }
-                
-                Write-Log "Step 13: Executing bulk copy ($($dataTable.Rows.Count) rows)" "INFO"
-                $bulkCopy = New-Object System.Data.SqlClient.SqlBulkCopy($Connection)
-                $bulkCopy.DestinationTableName = "[DBO].[$TableName]"
-                $bulkCopy.BatchSize = $BatchSize
-                $bulkCopy.BulkCopyTimeout = 600
-                
-                foreach ($colName in $matchingColumns) {
-                    $columnMapping = New-Object System.Data.SqlClient.SqlBulkCopyColumnMapping($colName, $colName)
-                    $bulkCopy.ColumnMappings.Add($columnMapping) | Out-Null
-                }
-                
-                $bulkCopy.WriteToServer($dataTable)
-                $rowsInserted = $dataTable.Rows.Count
-                
-                Write-Log "Bulk copy completed: $rowsInserted rows inserted" "SUCCESS"
-                
+                Write-Log "Step 12: Executing SQL Server BULK INSERT ($rowsProcessed rows)" "INFO"
+                $rowsInserted = Invoke-SqlBulkInsert -Connection $Connection -CsvFile $CsvFile -TableName $TableName -MatchingColumns $matchingColumns -TableColumnInfo $tableColumnInfo -TempFolder $TempFolder
+                Write-Log "Bulk insert completed: $rowsInserted rows inserted" "SUCCESS"
             } catch {
                 $rowsFailed = $rowsProcessed - $rowsInserted
-                Write-Log "Bulk copy failed: $_" "ERROR"
+                Write-Log "Bulk insert failed: $_" "ERROR"
                 throw
-            } finally {
-                if ($bulkCopy) {
-                    $bulkCopy.Close()
-                    $bulkCopy.Dispose()
-                }
-                if ($dataTable) {
-                    $dataTable.Dispose()
-                }
             }
             
             $duration = ((Get-Date) - $script:fileStartTime).TotalSeconds
@@ -486,7 +549,7 @@ VALUES
             
             Write-LogEntry -Connection $Connection -FileName $fileName -TableName $TableName -Status $status `
                 -RowsProcessed $rowsProcessed -RowsInserted $rowsInserted -RowsFailed $rowsFailed `
-                -BatchSize $BatchSize -DurationSeconds $duration `
+                -BatchSize 0 -DurationSeconds $duration `
                 -CsvColumnCount $csvColumns.Count -TableColumnCount $tableColumns.Count `
                 -MissingColumns ($missingColumns -join ', ')
             
@@ -502,7 +565,7 @@ VALUES
             $errorMsg = $_.Exception.Message
             Write-Log "Import failed: $errorMsg" "ERROR"
             Write-LogEntry -Connection $Connection -FileName $fileName -TableName $TableName -Status "FAILED" `
-                -RowsProcessed 0 -RowsInserted 0 -RowsFailed 0 -BatchSize $BatchSize `
+                -RowsProcessed 0 -RowsInserted 0 -RowsFailed 0 -BatchSize 0 `
                 -ErrorMessage $errorMsg -DurationSeconds $duration
             
             Move-CsvFile -CsvFile $CsvFile -DestinationFolder $ErrorFolder -Status "Error" | Out-Null
@@ -532,8 +595,16 @@ VALUES
         
         Ensure-LogTable -Connection $sqlConnection
         
-        $folders = Ensure-ProcessingFolders -BaseDirectory $CsvDirectory
+        if (-not [System.IO.Path]::IsPathRooted($CsvDirectory)) {
+            $CsvDirectory = Join-Path (Get-Location).Path $CsvDirectory
+        }
         
+        $CsvDirectory = $CsvDirectory.TrimEnd('\', '/')
+        $CsvDirectory = [System.IO.Path]::GetFullPath($CsvDirectory)
+        
+        $folders = Initialize-ProcessingFolders -BaseDirectory $CsvDirectory
+        
+        Write-Log "Looking for CSV files in: $CsvDirectory" "INFO"
         $csvFiles = Get-ChildItem $CsvDirectory -Filter "*.csv" -File | Sort-Object Name
         
         Write-Log "Found $($csvFiles.Count) CSV files to process"
@@ -547,7 +618,11 @@ VALUES
                 continue
             }
             
-            Import-CsvFile -Connection $sqlConnection -CsvFile $file -TableName $tableName -ProcessedFolder $folders.Processed -ErrorFolder $folders.Error
+            if ($TruncateBeforeImport.IsPresent) {
+                Import-CsvFile -Connection $sqlConnection -CsvFile $file -TableName $tableName -ProcessedFolder $folders.Processed -ErrorFolder $folders.Error -TruncateBeforeImport -TempFolder $TempFolder
+            } else {
+                Import-CsvFile -Connection $sqlConnection -CsvFile $file -TableName $tableName -ProcessedFolder $folders.Processed -ErrorFolder $folders.Error -TempFolder $TempFolder
+            }
             Write-Host ""
         }
         
@@ -564,5 +639,7 @@ VALUES
     }
 }
 
-Import-CsvToSql
+if ($MyInvocation.InvocationName -ne '.') {
+    Import-CsvToSql -CsvDirectory $CsvDirectory -ServerInstance $ServerInstance -Database $Database -Username $Username -Password $Password -IntegratedSecurity:$IntegratedSecurity -TruncateBeforeImport:$TruncateBeforeImport -TempFolder $TempFolder
+}
 
