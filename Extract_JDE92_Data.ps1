@@ -1,3 +1,28 @@
+#
+# Extract_JDE92_Data.ps1
+#
+# This script extracts data from the JDE92 database and saves it to CSV files.
+#
+# Usage:
+#   .\Extract_JDE92_Data.ps1
+#
+# The script will extract the data for the current day and save it to the DATA_FILES_TO_IMPORT folder.
+#
+# The script will log the progress to the extraction.log file.
+#
+# The script will use the Get-JDEJulianFromDate function to get the Julian date for the current day.
+#
+# The script will use the Start-OracleExportJob function to start the job to extract the data.
+#
+# The script will use the Get-Job function to get the jobs that are running.
+#
+# The script will use the Remove-Job function to remove the jobs that are running.
+#
+# The script will use the Get-Job function to get the jobs that are running.
+#
+# The script will use the Remove-Job function to remove the jobs that are running.
+
+
 
 #Add-Type -Path "c:\jobs\OracleDB-OCI\Oracle.ManagedDataAccess.dll"
 $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -23,6 +48,117 @@ function Get-JDEJulianFromDate {
     $dayOfYear = $date.DayOfYear
     $jdeYear = ($year - 1900)
     return [int]("$jdeYear$('{0:D3}' -f $dayOfYear)")
+}
+
+function Write-LogToFile {
+    param(
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logMessage = "[$timestamp] [$Level] $Message"
+    try {
+        if (-not (Test-Path $dataFilesPath)) {
+            New-Item -ItemType Directory -Path $dataFilesPath -Force | Out-Null
+        }
+        Add-Content -Path $logFile -Value $logMessage -Encoding UTF8 -ErrorAction SilentlyContinue
+    } catch {
+    }
+}
+
+function Test-OracleConnection {
+    param(
+        [string]$ConnectionString,
+        [string]$OciHost,
+        [string]$Port,
+        [string]$ServiceName,
+        [string]$User,
+        [string]$DllPath
+    )
+    
+    Write-Host ""
+    Write-Host "=== PRE-CHECK: Testing Oracle Database Connection ===" -ForegroundColor Cyan
+    Write-Host ""
+    Write-LogToFile "=== PRE-CHECK: Testing Oracle Database Connection ===" "INFO"
+    Write-LogToFile "Host: $OciHost, Port: $Port, Service: $ServiceName, User: $User" "INFO"
+    
+    $testConnection = $null
+    try {
+        Write-Host "Step 1: Loading Oracle.ManagedDataAccess.dll..." -ForegroundColor Yellow
+        Write-LogToFile "Step 1: Loading Oracle.ManagedDataAccess.dll from $DllPath" "INFO"
+        
+        try {
+            Add-Type -Path $DllPath -ErrorAction Stop
+            Write-Host "  Oracle DLL loaded successfully" -ForegroundColor Green
+            Write-LogToFile "Oracle DLL loaded successfully" "SUCCESS"
+        } catch {
+            $canUseOracleType = $false
+            try {
+                $null = [Oracle.ManagedDataAccess.Client.OracleConnection]
+                $canUseOracleType = $true
+            } catch {
+                $canUseOracleType = $false
+            }
+            
+            if (-not ($canUseOracleType -or ($_.Exception.Message -match "Assembly" -and $_.Exception.Message -match "already loaded"))) {
+                $errorMsg = "Failed to load Oracle.ManagedDataAccess.dll: $($_.Exception.Message)"
+                Write-Host "  $errorMsg" -ForegroundColor Red
+                Write-LogToFile $errorMsg "ERROR"
+                return $false
+            } else {
+                Write-Host "  Oracle types already available" -ForegroundColor Green
+                Write-LogToFile "Oracle types already available" "INFO"
+            }
+        }
+        
+        Write-Host "Step 2: Creating connection object..." -ForegroundColor Yellow
+        Write-LogToFile "Step 2: Creating Oracle connection object" "INFO"
+        $testConnection = New-Object Oracle.ManagedDataAccess.Client.OracleConnection($ConnectionString)
+        
+        Write-Host "Step 3: Opening connection to $OciHost`:$Port..." -ForegroundColor Yellow
+        Write-LogToFile "Step 3: Opening connection to $OciHost`:$Port" "INFO"
+        $testConnection.Open()
+        
+        Write-Host "Step 4: Executing test query (SELECT 1 FROM DUAL)..." -ForegroundColor Yellow
+        Write-LogToFile "Step 4: Executing test query" "INFO"
+        $testQuery = "SELECT 1 FROM DUAL"
+        $testCommand = $testConnection.CreateCommand()
+        $testCommand.CommandText = $testQuery
+        $testCommand.CommandTimeout = 30
+        $testCommand.ExecuteScalar() | Out-Null
+        $testCommand.Dispose()
+        
+        Write-Host "Step 5: Connection test successful!" -ForegroundColor Green
+        Write-Host "  Connected to Oracle database: $ServiceName" -ForegroundColor Green
+        Write-LogToFile "Connection test successful - Connected to Oracle database: $ServiceName" "SUCCESS"
+        return $true
+    } catch {
+        Write-Host "Step 5: Connection test FAILED" -ForegroundColor Red
+        $errorMessage = "Oracle connection test failed: $($_.Exception.Message)"
+        Write-Host "  $errorMessage" -ForegroundColor Red
+        Write-LogToFile $errorMessage "ERROR"
+        
+        if ($_.Exception.InnerException) {
+            $innerError = "Inner exception: $($_.Exception.InnerException.Message)"
+            Write-Host "  $innerError" -ForegroundColor Red
+            Write-LogToFile $innerError "ERROR"
+        }
+        
+        if ($_.Exception.Message -match "timeout" -or $_.Exception.Message -match "Connection request timed out") {
+            $timeoutMsg = "Connection timeout - check network connectivity, firewall rules, and Oracle server status at $OciHost`:$Port"
+            Write-Host "  $timeoutMsg" -ForegroundColor Red
+            Write-LogToFile $timeoutMsg "ERROR"
+        }
+        
+        return $false
+    } finally {
+        if ($null -ne $testConnection -and $testConnection.State -eq "Open") {
+            Write-Host "Closing test connection..." -ForegroundColor Gray
+            Write-LogToFile "Closing test connection" "INFO"
+            $testConnection.Close()
+            $testConnection.Dispose()
+        }
+    }
 }
 
 $jdeJulianToday = Get-JDEJulianFromDate -date (Get-Date)
@@ -131,12 +267,55 @@ $queries = @{
     F40942 = @{
         Sql     = "SELECT CKCPGP, CKCGP1, CKCGP2, CKCGP3, CKCGP4, CKCGP5, CKCGP6, CKCGP7, CKCGP8, CKCGP9, CKCGP10, CKCGID FROM SIDTA.F40942"
         CsvBase = "SICTL_F40942"
-    }    
+    }  
+    
+    # Finance Tables
+    F03B13 = @{
+        Sql = "SELECT RYPYID, RYCKNU, RYRYIN, RYDGJ, RYAN8, RYGLBA, RYCKAM, RYBCRC, RYCRRM, RYCRR, RYFCAM, RYCRCD, RYPOST, RYEXR, RYVRE, RYVDGJ, RYUPMJ FROM PRODDTA.F03B13 WHERE RYUPMJ = $jdeJulianToday"
+        CsvBase = "PRODDTA_F03B13"
+    }
+    F03B14 = @{
+        Sql = "SELECT RZPYID, RZCKNU, RZRC5, RZKCO, RZDCT, RZDOC, RZSFX, RZAN8, RZDCTM, RZDMTJ, RZDGJ, RZPAAP, RZBCRC, RZCRRM, RZCRR, RZPFAP, RZCRCD, RZRMK, RZPOST FROM PRODDTA.F03B14 WHERE RZUPMJ = $jdeJulianToday"
+        CsvBase = "PRODDTA_F03B14"
+    }
+    F0411 = @{
+        Sql = "SELECT RPKCO, RPDCT, RPDOC, RPSFX, RPCO, RPVINV, RPDIVJ, RPDDJ, RPGLBA, RPPYE, RPAG, RPCRRM, RPCRR, RPACR, RPCRCD FROM PRODDTA.F0411 WHERE RPUPMJ = $jdeJulianToday"
+        CsvBase = "PRODDTA_F0411"
+    }
+    F0413 = @{
+        Sql = "SELECT RMPYID, RMDCTM, RMDOCM, RMPYE, RMGLBA, RMDMTJ, RMVLDT, RMPAAP, RMCRCD, RMCRRM, RMVDGJ FROM PRODDTA.F0413 WHERE RMUPMJ = $jdeJulianToday"
+        CsvBase = "PRODDTA_F0413"
+    }
+    F041 = @{
+        Sql = "SELECT RNPYID, RNRC5, RNDCTM, RNKCO, RNDCT, RNDOC, RNSFX, RNPAAP, RNBCRC, RNCRRM, RNCRR, RNPFAP, RNCRCD, RNAN8, RNRMK, RNMCU, RNPOST, RNUPMJ FROM PRODDTA.F0414 WHERE RNUPMJ = $jdeJulianToday"
+        CsvBase = "PRODDTA_F041"
+    }
+    F0901 = @{
+        Sql = "SELECT GMAID, GMCO, GMMCU, GMOBJ, GMSUB, GMDL01, GMCRCD, GMR001, GMR002 FROM PRODDTA.F0901 WHERE GMUPMJ = $jdeJulianToday"
+        CsvBase = "PRODDTA_F0901"
+    }
+
     # Add more queries here
 }
 
 # === Build Connection String ===
 $connString = "User Id=$user;Password=$password;Data Source=(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=$oci_host)(PORT=$port)(CONNECT_TIMEOUT=30))(CONNECT_DATA=(SERVICE_NAME=$serviceName)))"
+
+# === Pre-Check: Test Oracle Database Connection ===
+if (-not (Test-OracleConnection -ConnectionString $connString -OciHost $oci_host -Port $port -ServiceName $serviceName -User $user -DllPath $dllPath)) {
+    Write-Host ""
+    $errorMsg = "Pre-check failed: Cannot connect to Oracle database. Script execution aborted."
+    Write-Host $errorMsg -ForegroundColor Red
+    Write-LogToFile $errorMsg "ERROR"
+    Write-Host "Check log file for details: $logFile" -ForegroundColor Yellow
+    Write-Host ""
+    exit 1
+}
+
+Write-Host ""
+Write-Host "=== PRE-CHECK PASSED: Proceeding with data extraction ===" -ForegroundColor Green
+Write-Host ""
+Write-LogToFile "=== PRE-CHECK PASSED: Proceeding with data extraction ===" "SUCCESS"
 
 # === Function: Export Query to CSV with Error Handling ===
 function Start-OracleExportJob {
@@ -306,6 +485,11 @@ function Start-OracleExportJob {
             $table.Load($rdr)
             $rowCount = $table.Rows.Count
 
+            if ($rowCount -eq 0) {
+                Write-Host "[$CsvBase] No rows found - skipping file export" -ForegroundColor Yellow
+                return @{ Success = $true; CsvBase = $CsvBase; RowCount = 0; Path = $null }
+            }
+
             $fileName = "${CsvBase}_${Timestamp}.csv"
             $csvPath = Join-Path $DataFilesPath $fileName
             $table | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
@@ -328,10 +512,17 @@ function Start-OracleExportJob {
     } -ArgumentList $Sql, $CsvBase, $Schema, $User, $Password, $ConnStr, $Timestamp, $DllPath, $DataFilesPath, $OciHost, $Port
 }
 
+# === Main Execution ===
+Write-Host "=== JDE92 Data Extraction Process Started ===" -ForegroundColor Cyan
+Write-Host "Host: $oci_host, Port: $port, Service: $serviceName, Schema: $targetSchema" -ForegroundColor Cyan
+Write-LogToFile "=== JDE92 Data Extraction Process Started ===" "INFO"
+Write-LogToFile "Host: $oci_host, Port: $port, Service: $serviceName, Schema: $targetSchema" "INFO"
+
 # === Clean up any existing jobs ===
 $existingJobs = Get-Job -ErrorAction SilentlyContinue
 if ($existingJobs) {
     Write-Host "Cleaning up $($existingJobs.Count) existing job(s)..." -ForegroundColor Yellow
+    Write-LogToFile "Cleaning up $($existingJobs.Count) existing job(s)" "INFO"
     $existingJobs | Remove-Job -Force -ErrorAction SilentlyContinue
 }
 

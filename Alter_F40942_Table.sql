@@ -1,0 +1,10 @@
+-- Drop existing primary key constraint
+ALTER TABLE [DBO].[F40942] DROP CONSTRAINT [F40942_PK];
+
+-- Make CKCGID NOT NULL (required for primary key)
+ALTER TABLE [DBO].[F40942] ALTER COLUMN [CKCGID] float NOT NULL;
+
+-- Add new primary key including CKCGID
+ALTER TABLE [DBO].[F40942] 
+ADD CONSTRAINT [F40942_PK] PRIMARY KEY ([CKCPGP], [CKCGP1], [CKCGP2], [CKCGP3], [CKCGP4], [CKCGP5], [CKCGP6], [CKCGP7], [CKCGP8], [CKCGP9], [CKCGP10], [CKCGID]);
+

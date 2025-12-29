@@ -23,8 +23,11 @@ function Import-CsvToSql {
     
     $ErrorActionPreference = "Stop"
     
-    $logTableName = "[DBO].[CSV_IMPORT_LOG]"
+    #$logTableName = "[DBO].[CSV_IMPORT_LOG]"
     $startTime = Get-Date
+    
+    $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
+    $logFilePath = Join-Path $scriptPath "import_run.log"
     
     function Write-Log {
         param(
@@ -39,6 +42,66 @@ function Import-CsvToSql {
             default { "White" }
         }
         Write-Host "[$timestamp] [$Level] $Message" -ForegroundColor $color
+    }
+    
+    function Write-LogToFile {
+        param(
+            [string]$Message,
+            [string]$Level = "INFO"
+        )
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $logMessage = "[$timestamp] [$Level] $Message"
+        try {
+            Add-Content -Path $logFilePath -Value $logMessage -Encoding UTF8 -ErrorAction SilentlyContinue
+        } catch {
+        }
+    }
+    
+    function Test-DatabaseConnection {
+        param(
+            [string]$ConnectionString,
+            [string]$ServerInstance,
+            [string]$Database
+        )
+        
+        Write-Log "Step 1: Creating connection object..." "INFO"
+        Write-LogToFile "Testing database connection to Server: $ServerInstance, Database: $Database" "INFO"
+        
+        $testConnection = $null
+        try {
+            Write-Log "Step 2: Opening connection to $ServerInstance..." "INFO"
+            $testConnection = New-Object System.Data.SqlClient.SqlConnection($ConnectionString)
+            $testConnection.Open()
+            
+            Write-Log "Step 3: Executing test query (SELECT @@VERSION)..." "INFO"
+            $testQuery = "SELECT @@VERSION"
+            $testCommand = New-Object System.Data.SqlClient.SqlCommand($testQuery, $testConnection)
+            $version = $testCommand.ExecuteScalar()
+            
+            Write-Log "Step 4: Connection test successful!" "SUCCESS"
+            Write-Log "SQL Server version detected" "SUCCESS"
+            Write-LogToFile "Database connection test successful" "SUCCESS"
+            return $true
+        } catch {
+            Write-Log "Step 4: Connection test FAILED" "ERROR"
+            $errorMessage = "Database connection test failed: $($_.Exception.Message)"
+            Write-Log $errorMessage "ERROR"
+            Write-LogToFile $errorMessage "ERROR"
+            
+            if ($_.Exception.InnerException) {
+                $innerError = "Inner exception: $($_.Exception.InnerException.Message)"
+                Write-Log $innerError "ERROR"
+                Write-LogToFile $innerError "ERROR"
+            }
+            
+            return $false
+        } finally {
+            if ($null -ne $testConnection -and $testConnection.State -eq "Open") {
+                Write-Log "Closing test connection..." "INFO"
+                $testConnection.Close()
+                $testConnection.Dispose()
+            }
+        }
     }
     
     function Initialize-ProcessingFolders {
@@ -576,22 +639,48 @@ VALUES
     
     Write-Log "=== CSV Import Process Started ===" "SUCCESS"
     Write-Log "Server: $ServerInstance, Database: $Database"
+    Write-LogToFile "=== CSV Import Process Started ===" "INFO"
+    Write-LogToFile "Server: $ServerInstance, Database: $Database" "INFO"
+    
+    Write-Host ""
+    Write-Log "=== PRE-CHECK: Testing Database Connection ===" "INFO"
+    Write-Host ""
     
     $connectionString = "Server=$ServerInstance;Database=$Database;"
     
     if ($IntegratedSecurity) {
         $connectionString += "Integrated Security=True;"
+        Write-Log "Using Integrated Security authentication" "INFO"
     } elseif ($Username -and $Password) {
         $connectionString += "User Id=$Username;Password=$Password;"
+        Write-Log "Using SQL Server authentication (User: $Username)" "INFO"
     } else {
-        throw "Either IntegratedSecurity must be specified or both Username and Password must be provided"
+        $errorMsg = "Either IntegratedSecurity must be specified or both Username and Password must be provided"
+        Write-Log $errorMsg "ERROR"
+        Write-LogToFile $errorMsg "ERROR"
+        throw $errorMsg
     }
+    
+    if (-not (Test-DatabaseConnection -ConnectionString $connectionString -ServerInstance $ServerInstance -Database $Database)) {
+        Write-Host ""
+        $errorMsg = "Pre-check failed: Cannot connect to database. Script execution aborted."
+        Write-Log $errorMsg "ERROR"
+        Write-LogToFile $errorMsg "ERROR"
+        Write-Log "Check log file for details: $logFilePath" "ERROR"
+        Write-Host ""
+        exit 1
+    }
+    
+    Write-Host ""
+    Write-Log "=== PRE-CHECK PASSED: Proceeding with import ===" "SUCCESS"
+    Write-Host ""
     
     $sqlConnection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
     
     try {
         $sqlConnection.Open()
         Write-Log "Connected to database" "SUCCESS"
+        Write-LogToFile "Connected to database" "SUCCESS"
         
         New-LogTable -Connection $sqlConnection
         
@@ -630,7 +719,15 @@ VALUES
         Write-Log "=== Import Process Completed in $([math]::Round($totalDuration, 2)) seconds ===" "SUCCESS"
         
     } catch {
-        Write-Log "Fatal error: $_" "ERROR"
+        $errorMsg = "Fatal error: $_"
+        Write-Log $errorMsg "ERROR"
+        Write-LogToFile $errorMsg "ERROR"
+        if ($_.Exception.InnerException) {
+            $innerError = "Inner exception: $($_.Exception.InnerException.Message)"
+            Write-Log $innerError "ERROR"
+            Write-LogToFile $innerError "ERROR"
+        }
+        Write-Log "Check log file for details: $logFilePath" "ERROR"
         throw
     } finally {
         if ($sqlConnection.State -eq "Open") {
