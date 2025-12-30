@@ -5,7 +5,7 @@ param(
     [string]$Username = 'sa',
     [string]$Password = 'Pcare2009',
     [switch]$IntegratedSecurity,
-    [switch]$TruncateBeforeImport,
+    [bool]$TruncateBeforeImport = $true,
     [string]$TempFolder = "C:\Temp\CSV_Import"
 )
 
@@ -17,7 +17,7 @@ function Import-CsvToSql {
         [string]$Username = 'sa',
         [string]$Password = 'Pcare2009',
         [switch]$IntegratedSecurity,
-        [switch]$TruncateBeforeImport,
+        [bool]$TruncateBeforeImport = $true,
         [string]$TempFolder = "C:\Temp\CSV_Import"
     )
     
@@ -707,7 +707,7 @@ VALUES
                 continue
             }
             
-            if ($TruncateBeforeImport.IsPresent) {
+            if ($TruncateBeforeImport) {
                 Import-CsvFile -Connection $sqlConnection -CsvFile $file -TableName $tableName -ProcessedFolder $folders.Processed -ErrorFolder $folders.Error -TruncateBeforeImport -TempFolder $TempFolder
             } else {
                 Import-CsvFile -Connection $sqlConnection -CsvFile $file -TableName $tableName -ProcessedFolder $folders.Processed -ErrorFolder $folders.Error -TempFolder $TempFolder
@@ -737,6 +737,6 @@ VALUES
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
-    Import-CsvToSql -CsvDirectory $CsvDirectory -ServerInstance $ServerInstance -Database $Database -Username $Username -Password $Password -IntegratedSecurity:$IntegratedSecurity -TruncateBeforeImport:$TruncateBeforeImport -TempFolder $TempFolder
+    Import-CsvToSql -CsvDirectory $CsvDirectory -ServerInstance $ServerInstance -Database $Database -Username $Username -Password $Password -IntegratedSecurity:$IntegratedSecurity -TruncateBeforeImport $TruncateBeforeImport -TempFolder $TempFolder
 }
 
