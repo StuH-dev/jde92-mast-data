@@ -842,9 +842,29 @@ WHERE rd.rn > 1
             $columnList = ($MatchingColumns | ForEach-Object { "[$_]" }) -join ", "
             $sourceColumnList = ($MatchingColumns | ForEach-Object { "s.[$_]" }) -join ", "
             $pkMatchConditions = ($primaryKeyColumns | ForEach-Object { "t.[$_] = s.[$_]" }) -join " AND "
-            $updateSet = ($MatchingColumns | ForEach-Object { "t.[$_] = s.[$_]" }) -join ", "
             
-            $mergeQuery = @"
+            $nonPkColumns = @($MatchingColumns | Where-Object { $primaryKeyColumns -notcontains $_ })
+            if ($nonPkColumns.Count -eq 0) {
+                $nonPkColumns = $MatchingColumns
+            }
+            
+            $updateSet = ($nonPkColumns | ForEach-Object { "t.[$_] = s.[$_]" }) -join ", "
+            
+            $changeConditions = @()
+            foreach ($col in $nonPkColumns) {
+                $dataType = $TableColumnInfo[$col].DataType
+                if ($dataType -like "*char*" -or $dataType -like "*text*" -or $dataType -like "*binary*") {
+                    $changeConditions += "(ISNULL(CAST(t.[$col] AS NVARCHAR(MAX)), '') <> ISNULL(CAST(s.[$col] AS NVARCHAR(MAX)), ''))"
+                } elseif ($dataType -like "*date*" -or $dataType -like "*time*") {
+                    $changeConditions += "(t.[$col] <> s.[$col] OR (t.[$col] IS NULL AND s.[$col] IS NOT NULL) OR (t.[$col] IS NOT NULL AND s.[$col] IS NULL))"
+                } else {
+                    $changeConditions += "(t.[$col] <> s.[$col] OR (t.[$col] IS NULL AND s.[$col] IS NOT NULL) OR (t.[$col] IS NOT NULL AND s.[$col] IS NULL))"
+                }
+            }
+            $changeCondition = if ($changeConditions.Count -gt 0) { "AND (" + ($changeConditions -join " OR ") + ")" } else { "" }
+            
+            if ($changeCondition -eq "") {
+                $mergeQuery = @"
 MERGE [DBO].[$TableName] AS t
 USING [$tempTableName] AS s
 ON ($pkMatchConditions)
@@ -854,12 +874,29 @@ WHEN NOT MATCHED BY TARGET THEN
     INSERT ($columnList)
     VALUES ($sourceColumnList);
 "@
+            } else {
+                $mergeQuery = @"
+MERGE [DBO].[$TableName] AS t
+USING [$tempTableName] AS s
+ON ($pkMatchConditions)
+WHEN MATCHED $changeCondition THEN
+    UPDATE SET $updateSet
+WHEN NOT MATCHED BY TARGET THEN
+    INSERT ($columnList)
+    VALUES ($sourceColumnList);
+"@
+            }
             
             try {
                 $command = New-Object System.Data.SqlClient.SqlCommand($mergeQuery, $Connection)
                 $command.CommandTimeout = 600
                 $rowsAffected = $command.ExecuteNonQuery()
-                Write-Log "MERGE completed successfully: $rowsAffected rows affected" "SUCCESS"
+                
+                if ($rowsAffected -gt 0) {
+                    Write-Log "MERGE completed successfully: $rowsAffected rows affected" "SUCCESS"
+                } else {
+                    Write-Log "MERGE completed: No changes detected (all rows already match current values)" "INFO"
+                }
             } catch {
                 $errorMsg = $_.Exception.Message
                 if ($errorMsg -like "*PRIMARY KEY constraint*" -or $errorMsg -like "*UNIQUE constraint*") {
@@ -1186,12 +1223,16 @@ VALUES
             
             $duration = ((Get-Date) - $script:fileStartTime).TotalSeconds
             
-            if ($rowsInserted -eq 0) {
+            if ($rowsInserted -eq 0 -and $processType -ne "Merge") {
                 if ($rowsFailed -gt 0) {
                     throw "Import failed: No rows were inserted. $rowsFailed rows failed to process."
                 } else {
                     throw "Import failed: No rows were inserted"
                 }
+            }
+            
+            if ($rowsInserted -eq 0 -and $processType -eq "Merge") {
+                Write-Log "MERGE completed with no changes - all rows already match current values" "INFO"
             }
             
             if ($rowsFailed -gt 0) {
