@@ -5,13 +5,116 @@ param(
     [string]$Username = 'sa',
     [string]$Password = 'Pcare2009',
     [switch]$IntegratedSecurity,
-    [bool]$TruncateBeforeImport = $true,
-    [string]$TempFolder = "C:\Users\shedger\Documents\code\JDE92-Master-Data\DATA_FILES_TO_IMPORT",
-    [hashtable]$TruncateTableForFiles = @{
-        "SIDTA_F4008" = $true
-        "SIDTA_F40942" = $true
-    }
+    [bool]$TruncateBeforeImport = $false,
+    [string]$TempFolder = "C:\Users\shedger\Documents\code\JDE92-Master-Data\DATA_FILES_TO_IMPORT"
 )
+
+$script:TableProcessingConfig = @{
+    "SIDTA_F4101" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F4102" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F4104" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F4106" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F41002" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F0101" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F03012" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F0111" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F01151" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F0116" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F0115" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F4201" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F0006" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F4008" = @{
+        Truncate = $true
+        ProcessType = "BulkInsert"
+    }
+    "SIDTA_F03B11" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F41021" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F0150" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SICTL_F0005" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F40942" = @{
+        Truncate = $true
+        ProcessType = "BulkInsert"
+    }
+    "SIDTA_Sales" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F03B13" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F03B14" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F0411" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F0413" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F0414" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+    "SIDTA_F0901" = @{
+        Truncate = $false
+        ProcessType = "Merge"
+    }
+}
 
 function Import-CsvToSql {
     param(
@@ -22,11 +125,7 @@ function Import-CsvToSql {
         [string]$Password = 'Pcare2009',
         [switch]$IntegratedSecurity,
         [bool]$TruncateBeforeImport = $true,
-        [string]$TempFolder = "C:\Users\shedger\Documents\code\JDE92-Master-Data\DATA_FILES_TO_IMPORT",
-        [hashtable]$TruncateTableForFiles = @{
-            "SIDTA_F4008" = $true
-            "SIDTA_F40942" = $true
-        }
+        [string]$TempFolder = "C:\Users\shedger\Documents\code\JDE92-Master-Data\DATA_FILES_TO_IMPORT"
     )
     
     $ErrorActionPreference = "Stop"
@@ -250,6 +349,63 @@ ORDER BY ORDINAL_POSITION
         return $columns
     }
     
+    function Get-PrimaryKeyColumns {
+        param(
+            [System.Data.SqlClient.SqlConnection]$Connection,
+            [string]$TableName
+        )
+        
+        $query = @"
+SELECT 
+    c.COLUMN_NAME
+FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE c
+    ON tc.CONSTRAINT_NAME = c.CONSTRAINT_NAME
+    AND tc.TABLE_SCHEMA = c.TABLE_SCHEMA
+    AND tc.TABLE_NAME = c.TABLE_NAME
+WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+    AND tc.TABLE_SCHEMA = 'DBO'
+    AND tc.TABLE_NAME = @TableName
+ORDER BY c.ORDINAL_POSITION
+"@
+        
+        $command = New-Object System.Data.SqlClient.SqlCommand($query, $Connection)
+        $command.Parameters.AddWithValue("@TableName", $TableName) | Out-Null
+        $reader = $command.ExecuteReader()
+        
+        $primaryKeys = @()
+        while ($reader.Read()) {
+            $primaryKeys += $reader["COLUMN_NAME"].ToString()
+        }
+        $reader.Close()
+        
+        return $primaryKeys
+    }
+    
+    function Get-TableProcessingConfig {
+        param(
+            [string]$FileName
+        )
+        
+        $matchingKey = $script:TableProcessingConfig.Keys | Where-Object { $FileName -like "*$_*" } | Select-Object -First 1
+        if ($matchingKey) {
+            $config = $script:TableProcessingConfig[$matchingKey]
+            return @{
+                Found = $true
+                Key = $matchingKey
+                Truncate = if ($config.Truncate -is [bool]) { $config.Truncate } else { $false }
+                ProcessType = if ($config.ProcessType) { $config.ProcessType } else { "BulkInsert" }
+            }
+        }
+        
+        return @{
+            Found = $false
+            Key = $null
+            Truncate = $false
+            ProcessType = "BulkInsert"
+        }
+    }
+    
     function Invoke-SqlBulkInsert {
         param(
             [System.Data.SqlClient.SqlConnection]$Connection,
@@ -463,6 +619,305 @@ WHERE rn = 1
         }
     }
     
+    function Invoke-SqlMerge {
+        param(
+            [System.Data.SqlClient.SqlConnection]$Connection,
+            [System.IO.FileInfo]$CsvFile,
+            [string]$TableName,
+            [array]$MatchingColumns,
+            [hashtable]$TableColumnInfo,
+            [string]$TempFolder
+        )
+        
+        Write-Log "Retrieving primary key columns for table $TableName" "INFO"
+        $primaryKeyColumns = Get-PrimaryKeyColumns -Connection $Connection -TableName $TableName
+        
+        if ($primaryKeyColumns.Count -eq 0) {
+            Write-Log "Warning: No primary key found for table $TableName. Falling back to matching on all columns." "WARNING"
+            $primaryKeyColumns = $MatchingColumns
+        } else {
+            $missingPkColumns = @($primaryKeyColumns | Where-Object { $MatchingColumns -notcontains $_ })
+            if ($missingPkColumns.Count -gt 0) {
+                Write-Log "Warning: Some primary key columns are missing from CSV: $($missingPkColumns -join ', '). Falling back to matching on all columns." "WARNING"
+                $primaryKeyColumns = $MatchingColumns
+            } else {
+                Write-Log "Using primary key columns for MERGE matching: $($primaryKeyColumns -join ', ')" "INFO"
+            }
+        }
+        
+        $tempTableName = "##TempImport_$([System.Guid]::NewGuid().ToString().Replace('-', ''))"
+        
+        try {
+            Write-Log "Reading CSV data into memory" "INFO"
+            $csvData = Import-Csv -Path $CsvFile.FullName -Encoding UTF8
+            
+            Write-Log "Creating temporary staging table: $tempTableName" "INFO"
+            
+            $createTempTableQuery = "CREATE TABLE [$tempTableName] ("
+            $columns = @()
+            foreach ($colName in $MatchingColumns) {
+                $dataType = $TableColumnInfo[$colName].DataType
+                $charLength = $TableColumnInfo[$colName].CharLength
+                $isNullable = $TableColumnInfo[$colName].IsNullable
+                
+                $sqlType = switch -Regex ($dataType) {
+                    '^(n?char)' {
+                        if ($null -ne $charLength) {
+                            "$dataType($charLength)"
+                        } else {
+                            "$dataType(255)"
+                        }
+                    }
+                    '^(n?varchar)' {
+                        if ($null -ne $charLength) {
+                            "$dataType($charLength)"
+                        } else {
+                            "$dataType(MAX)"
+                        }
+                    }
+                    default { $dataType }
+                }
+                
+                $nullability = if ($isNullable) { "NULL" } else { "NOT NULL" }
+                $columns += "[$colName] $sqlType $nullability"
+            }
+            $createTempTableQuery += ($columns -join ", ") + ")"
+            
+            $command = New-Object System.Data.SqlClient.SqlCommand($createTempTableQuery, $Connection)
+            $command.ExecuteNonQuery() | Out-Null
+            
+            Write-Log "Loading data into staging table using SqlBulkCopy" "INFO"
+            
+            $bulkCopy = New-Object System.Data.SqlClient.SqlBulkCopy($Connection)
+            $bulkCopy.DestinationTableName = "[$tempTableName]"
+            $bulkCopy.BatchSize = 1000
+            $bulkCopy.BulkCopyTimeout = 300
+            
+            $dataTable = New-Object System.Data.DataTable
+            foreach ($colName in $MatchingColumns) {
+                $dataType = $TableColumnInfo[$colName].DataType
+                $netType = switch -Regex ($dataType) {
+                    '^int$' { [System.Int32] }
+                    '^bigint$' { [System.Int64] }
+                    '^smallint$' { [System.Int16] }
+                    '^tinyint$' { [System.Byte] }
+                    '^bit$' { [System.Boolean] }
+                    '^decimal|numeric' { [System.Decimal] }
+                    '^float$' { [System.Double] }
+                    '^real$' { [System.Single] }
+                    '^money$' { [System.Decimal] }
+                    '^smallmoney$' { [System.Decimal] }
+                    '^date$' { [System.DateTime] }
+                    '^datetime$' { [System.DateTime] }
+                    '^datetime2$' { [System.DateTime] }
+                    '^smalldatetime$' { [System.DateTime] }
+                    '^time$' { [System.TimeSpan] }
+                    default { [System.String] }
+                }
+                $dataTable.Columns.Add($colName, $netType) | Out-Null
+                $bulkCopy.ColumnMappings.Add($colName, $colName) | Out-Null
+            }
+            
+            $rowCount = 0
+            $skippedRows = 0
+            foreach ($row in $csvData) {
+                $dataRow = $dataTable.NewRow()
+                $skipRow = $false
+                
+                foreach ($colName in $MatchingColumns) {
+                    $val = $row.$colName
+                    $isNullable = $TableColumnInfo[$colName].IsNullable
+                    $dataType = $TableColumnInfo[$colName].DataType
+                    $netType = $dataTable.Columns[$colName].DataType
+                    
+                    if ([string]::IsNullOrWhiteSpace($val)) {
+                        if ($isNullable) {
+                            $dataRow[$colName] = [DBNull]::Value
+                        } else {
+                            $defaultValue = switch -Regex ($dataType) {
+                                '^int$' { 0 }
+                                '^bigint$' { [long]0 }
+                                '^smallint$' { [short]0 }
+                                '^tinyint$' { [byte]0 }
+                                '^bit$' { $false }
+                                '^decimal|numeric' { [decimal]0 }
+                                '^float$' { [double]0 }
+                                '^real$' { [float]0 }
+                                '^money$|^smallmoney$' { [decimal]0 }
+                                '^date$|^datetime$|^datetime2$|^smalldatetime$' { [System.DateTime]::MinValue }
+                                default { "" }
+                            }
+                            $dataRow[$colName] = $defaultValue
+                        }
+                    } else {
+                        try {
+                            if ($netType -eq [System.DateTime]) {
+                                $parsedDate = [System.DateTime]::MinValue
+                                if ([System.DateTime]::TryParse($val, [ref]$parsedDate)) {
+                                    $dataRow[$colName] = $parsedDate
+                                } else {
+                                    if ($isNullable) {
+                                        $dataRow[$colName] = [DBNull]::Value
+                                    } else {
+                                        $dataRow[$colName] = [System.DateTime]::MinValue
+                                    }
+                                }
+                            } elseif ($netType -eq [System.Boolean]) {
+                                $boolVal = $false
+                                if ([bool]::TryParse($val, [ref]$boolVal)) {
+                                    $dataRow[$colName] = $boolVal
+                                } else {
+                                    $dataRow[$colName] = ($val -ne "0" -and $val -ne "" -and $val -ne "false")
+                                }
+                            } elseif ($netType.IsValueType -and $netType -ne [System.String]) {
+                                $dataRow[$colName] = [Convert]::ChangeType($val, $netType)
+                            } else {
+                                $dataRow[$colName] = $val
+                            }
+                        } catch {
+                            $errorMsg = $_.Exception.Message
+                            Write-Log "Warning: Could not convert value '$val' for column $colName (type: $dataType) in row ${rowCount}: $errorMsg" "WARNING"
+                            if ($isNullable) {
+                                $dataRow[$colName] = [DBNull]::Value
+                            } else {
+                                $skipRow = $true
+                                break
+                            }
+                        }
+                    }
+                }
+                
+                if (-not $skipRow) {
+                    $dataTable.Rows.Add($dataRow)
+                    $rowCount++
+                    
+                    if ($rowCount % 1000 -eq 0) {
+                        $bulkCopy.WriteToServer($dataTable)
+                        $dataTable.Clear()
+                        Write-Log "Loaded $rowCount rows..." "INFO"
+                    }
+                } else {
+                    $skippedRows++
+                }
+            }
+            
+            if ($skippedRows -gt 0) {
+                Write-Log "Skipped $skippedRows rows due to data validation errors" "WARNING"
+            }
+            
+            if ($dataTable.Rows.Count -gt 0) {
+                $bulkCopy.WriteToServer($dataTable)
+            }
+            
+            $bulkCopy.Close()
+            
+            Write-Log "Deduplicating staging table data based on primary key" "INFO"
+            $pkColumnList = ($primaryKeyColumns | ForEach-Object { "[$_]" }) -join ", "
+            
+            $dedupeQuery = @"
+WITH RankedData AS (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY $pkColumnList ORDER BY (SELECT NULL)) AS rn
+    FROM [$tempTableName]
+)
+DELETE t
+FROM [$tempTableName] t
+INNER JOIN RankedData rd ON $(($primaryKeyColumns | ForEach-Object { "t.[$_] = rd.[$_]" }) -join " AND ")
+WHERE rd.rn > 1
+"@
+            
+            try {
+                $command = New-Object System.Data.SqlClient.SqlCommand($dedupeQuery, $Connection)
+                $duplicatesRemoved = $command.ExecuteNonQuery()
+                if ($duplicatesRemoved -gt 0) {
+                    Write-Log "Removed $duplicatesRemoved duplicate rows from staging table based on primary key" "INFO"
+                } else {
+                    Write-Log "No duplicates found in staging table" "INFO"
+                }
+            } catch {
+                Write-Log "Warning: Could not deduplicate staging table: $_" "WARNING"
+            }
+            
+            Write-Log "Performing MERGE operation from staging table to target table" "INFO"
+            
+            $columnList = ($MatchingColumns | ForEach-Object { "[$_]" }) -join ", "
+            $sourceColumnList = ($MatchingColumns | ForEach-Object { "s.[$_]" }) -join ", "
+            $pkMatchConditions = ($primaryKeyColumns | ForEach-Object { "t.[$_] = s.[$_]" }) -join " AND "
+            $updateSet = ($MatchingColumns | ForEach-Object { "t.[$_] = s.[$_]" }) -join ", "
+            
+            $mergeQuery = @"
+MERGE [DBO].[$TableName] AS t
+USING [$tempTableName] AS s
+ON ($pkMatchConditions)
+WHEN MATCHED THEN
+    UPDATE SET $updateSet
+WHEN NOT MATCHED BY TARGET THEN
+    INSERT ($columnList)
+    VALUES ($sourceColumnList);
+"@
+            
+            try {
+                $command = New-Object System.Data.SqlClient.SqlCommand($mergeQuery, $Connection)
+                $command.CommandTimeout = 600
+                $rowsAffected = $command.ExecuteNonQuery()
+                Write-Log "MERGE completed successfully: $rowsAffected rows affected" "SUCCESS"
+            } catch {
+                $errorMsg = $_.Exception.Message
+                if ($errorMsg -like "*PRIMARY KEY constraint*" -or $errorMsg -like "*UNIQUE constraint*") {
+                    Write-Log "Constraint violation detected. Attempting to identify problematic rows..." "ERROR"
+                    
+                    $checkQuery = @"
+SELECT TOP 10 $pkColumnList, COUNT(*) as cnt
+FROM [$tempTableName]
+GROUP BY $pkColumnList
+HAVING COUNT(*) > 1
+"@
+                    try {
+                        $checkCommand = New-Object System.Data.SqlClient.SqlCommand($checkQuery, $Connection)
+                        $checkReader = $checkCommand.ExecuteReader()
+                        $duplicateKeys = @()
+                        while ($checkReader.Read()) {
+                            $keyValues = @()
+                            foreach ($pkCol in $primaryKeyColumns) {
+                                $keyValues += "$pkCol = $($checkReader[$pkCol])"
+                            }
+                            $duplicateKeys += ($keyValues -join ", ")
+                        }
+                        $checkReader.Close()
+                        
+                        if ($duplicateKeys.Count -gt 0) {
+                            Write-Log "Found duplicate primary keys in staging table: $($duplicateKeys -join '; ')" "ERROR"
+                        }
+                    } catch {
+                        Write-Log "Could not identify duplicate keys: $_" "WARNING"
+                    }
+                    
+                    throw "MERGE failed due to constraint violation: $errorMsg"
+                } else {
+                    throw
+                }
+            }
+            
+            Write-Log "Dropping temporary staging table" "INFO"
+            $dropQuery = "DROP TABLE [$tempTableName]"
+            $command = New-Object System.Data.SqlClient.SqlCommand($dropQuery, $Connection)
+            $command.ExecuteNonQuery() | Out-Null
+            
+            return $rowsAffected
+        } catch {
+            try {
+                if ($null -ne $bulkCopy) {
+                    $bulkCopy.Close()
+                }
+                $dropQuery = "IF OBJECT_ID('tempdb..[$tempTableName]') IS NOT NULL DROP TABLE [$tempTableName]"
+                $command = New-Object System.Data.SqlClient.SqlCommand($dropQuery, $Connection)
+                $command.ExecuteNonQuery() | Out-Null
+            } catch {
+                Write-Log "Warning: Could not drop temporary table $tempTableName" "WARNING"
+            }
+            throw
+        }
+    }
+    
     function Write-LogEntry {
         param(
             [System.Data.SqlClient.SqlConnection]$Connection,
@@ -527,8 +982,7 @@ VALUES
             [string]$ErrorFolder,
             [string]$SourceFolder,
             [switch]$TruncateBeforeImport,
-            [string]$TempFolder,
-            [hashtable]$TruncateTableForFiles = @{}
+            [string]$TempFolder
         )
         
         $script:fileStartTime = Get-Date
@@ -673,17 +1127,21 @@ VALUES
                 Write-Log "Missing optional columns (will be set to NULL): $($missingColumns -join ', ')" "WARNING"
             }
             
-            Write-Host "Step 11: Preparing bulk insert..." -ForegroundColor Gray
-            Write-Log "Step 11: Preparing bulk insert" "INFO"
+            Write-Host "Step 11: Preparing data import..." -ForegroundColor Gray
+            Write-Log "Step 11: Preparing data import" "INFO"
             
+            $processingConfig = Get-TableProcessingConfig -FileName $fileName
             $shouldTruncate = $false
-            $matchingKey = $TruncateTableForFiles.Keys | Where-Object { $fileName -like "*$_*" } | Select-Object -First 1
-            if ($matchingKey) {
-                $shouldTruncate = $TruncateTableForFiles[$matchingKey]
-                Write-Host "Hash table match: '$fileName' -> key '$matchingKey' = $shouldTruncate" -ForegroundColor Cyan
-                Write-Log "File '$fileName' matched hash table key '$matchingKey'. Truncate setting: $shouldTruncate" "INFO"
+            $processType = "BulkInsert"
+            
+            if ($processingConfig.Found) {
+                $shouldTruncate = $processingConfig.Truncate
+                $processType = $processingConfig.ProcessType
+                Write-Host "Hash table match: '$fileName' -> key '$($processingConfig.Key)' | Truncate: $shouldTruncate | ProcessType: $processType" -ForegroundColor Cyan
+                Write-Log "File '$fileName' matched hash table key '$($processingConfig.Key)'. Truncate: $shouldTruncate, ProcessType: $processType" "INFO"
             } elseif ($TruncateBeforeImport) {
                 $shouldTruncate = $true
+                $processType = "BulkInsert"
                 Write-Host "No hash table match. Using global TruncateBeforeImport = $shouldTruncate" -ForegroundColor Yellow
                 Write-Log "File '$fileName' not in hash table. Using global TruncateBeforeImport: $shouldTruncate" "INFO"
             } else {
@@ -706,16 +1164,23 @@ VALUES
             $rowsFailed = 0
             
             Write-Host ""
-            Write-Host "Step 12: Executing bulk insert ($rowsProcessed rows)..." -ForegroundColor Yellow
+            Write-Host "Step 12: Executing $processType ($rowsProcessed rows)..." -ForegroundColor Yellow
             Write-Host "This may take a moment..." -ForegroundColor Gray
             try {
-                Write-Log "Step 12: Executing SQL Server BULK INSERT ($rowsProcessed rows)" "INFO"
-                $rowsInserted = Invoke-SqlBulkInsert -Connection $Connection -CsvFile $CsvFile -TableName $TableName -MatchingColumns $matchingColumns -TableColumnInfo $tableColumnInfo -TempFolder $TempFolder
-                Write-Host "Bulk insert completed: $rowsInserted rows inserted" -ForegroundColor Green
-                Write-Log "Bulk insert completed: $rowsInserted rows inserted" "SUCCESS"
+                Write-Log "Step 12: Executing $processType ($rowsProcessed rows)" "INFO"
+                
+                if ($processType -eq "Merge") {
+                    $rowsInserted = Invoke-SqlMerge -Connection $Connection -CsvFile $CsvFile -TableName $TableName -MatchingColumns $matchingColumns -TableColumnInfo $tableColumnInfo -TempFolder $TempFolder
+                    Write-Host "Merge completed: $rowsInserted rows affected" -ForegroundColor Green
+                    Write-Log "Merge completed: $rowsInserted rows affected" "SUCCESS"
+                } else {
+                    $rowsInserted = Invoke-SqlBulkInsert -Connection $Connection -CsvFile $CsvFile -TableName $TableName -MatchingColumns $matchingColumns -TableColumnInfo $tableColumnInfo -TempFolder $TempFolder
+                    Write-Host "Bulk insert completed: $rowsInserted rows inserted" -ForegroundColor Green
+                    Write-Log "Bulk insert completed: $rowsInserted rows inserted" "SUCCESS"
+                }
             } catch {
                 $rowsFailed = $rowsProcessed - $rowsInserted
-                Write-Log "Bulk insert failed: $_" "ERROR"
+                Write-Log "$processType failed: $_" "ERROR"
                 throw
             }
             
@@ -888,9 +1353,9 @@ VALUES
             }
             
             if ($TruncateBeforeImport) {
-                Import-CsvFile -Connection $sqlConnection -CsvFile $file -TableName $tableName -ProcessedFolder $folders.Processed -ErrorFolder $folders.Error -SourceFolder $CsvDirectory -TruncateBeforeImport -TempFolder $TempFolder -TruncateTableForFiles $TruncateTableForFiles
+                Import-CsvFile -Connection $sqlConnection -CsvFile $file -TableName $tableName -ProcessedFolder $folders.Processed -ErrorFolder $folders.Error -SourceFolder $CsvDirectory -TruncateBeforeImport -TempFolder $TempFolder
             } else {
-                Import-CsvFile -Connection $sqlConnection -CsvFile $file -TableName $tableName -ProcessedFolder $folders.Processed -ErrorFolder $folders.Error -SourceFolder $CsvDirectory -TempFolder $TempFolder -TruncateTableForFiles $TruncateTableForFiles
+                Import-CsvFile -Connection $sqlConnection -CsvFile $file -TableName $tableName -ProcessedFolder $folders.Processed -ErrorFolder $folders.Error -SourceFolder $CsvDirectory -TempFolder $TempFolder
             }
             Write-Host ""
             Write-Host "--- Completed file $fileIndex of $($csvFiles.Count) ---" -ForegroundColor Cyan
@@ -941,5 +1406,5 @@ Write-Host ""
 Write-Host "Starting CSV Import Script..." -ForegroundColor Cyan
 Write-Host "Press Ctrl+C to cancel at any time" -ForegroundColor Gray
 Write-Host ""
-Import-CsvToSql -CsvDirectory $CsvDirectory -ServerInstance $ServerInstance -Database $Database -Username $Username -Password $Password -IntegratedSecurity:$IntegratedSecurity -TruncateBeforeImport $TruncateBeforeImport -TempFolder $TempFolder -TruncateTableForFiles $TruncateTableForFiles
+Import-CsvToSql -CsvDirectory $CsvDirectory -ServerInstance $ServerInstance -Database $Database -Username $Username -Password $Password -IntegratedSecurity:$IntegratedSecurity -TruncateBeforeImport $TruncateBeforeImport -TempFolder $TempFolder
 
